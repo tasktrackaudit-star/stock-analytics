@@ -1336,80 +1336,96 @@ const NIFTY500 = [
 
 // ═══════════════════════════════════════════════
 // BACKEND CONFIG
-// History & Indicators → Yahoo Finance directly (no server needed)
-// AI Forecast          → Render.com cloud backend
+// All data (history, indicators, forecast) served from server.py v6
+// which uses SQLite + scheduled yfinance updates with unlimited retries.
+// No hard timeouts -- server keeps retrying until data arrives.
 // ═══════════════════════════════════════════════
+const SERVER = 'http://localhost:7777';
 
-// ── STEP: After deploying to Render, paste your URL here ──────────────────
+// For online deployment: paste your Render.com URL here after deploying.
 // Example: const RENDER_BACKEND = 'https://nse-stock-analyzer.onrender.com';
-const RENDER_BACKEND = 'https://nse-stock-market-0g1m.onrender.com';
-// ─────────────────────────────────────────────────────────────────────────
+const RENDER_BACKEND = 'YOUR_RENDER_URL_HERE';
 
-// Yahoo Finance v8 via allorigins CORS proxy
-const YF_PROXY = 'https://query1.finance.yahoo.com';
+// Resolve which backend to use: local server first, Render fallback
+function backendUrl() {
+  // In a local/desktop context the launcher sets up localhost:7777
+  // In a hosted (GitHub Pages) context RENDER_BACKEND is used
+  return (typeof window !== 'undefined' && window.location.protocol === 'file:')
+    ? SERVER
+    : (RENDER_BACKEND !== 'YOUR_RENDER_URL_HERE' ? RENDER_BACKEND : SERVER);
+}
+
+// ── Patient fetch: never shows a timeout error, retries silently ──────────
+async function patientFetch(url, loaderMsgEl, messages, timeoutMs = 120000) {
+  // timeoutMs is a DISPLAY timeout only -- we just cycle the message.
+  // The actual fetch is allowed to run as long as needed.
+  let msgIdx = 0;
+  const msgTimer = messages && loaderMsgEl
+    ? setInterval(() => {
+        loaderMsgEl.textContent = messages[msgIdx % messages.length];
+        msgIdx++;
+      }, 4000)
+    : null;
+
+  try {
+    // No AbortSignal -- let the server take as long as it needs
+    const res = await fetch(url);
+    if (msgTimer) clearInterval(msgTimer);
+    return res;
+  } catch (e) {
+    if (msgTimer) clearInterval(msgTimer);
+    // Re-throw with a friendly message (no "network error" jargon)
+    throw new Error('Could not reach the data server. Please check your connection and try again.');
+  }
+}
 
 async function checkServer() {
-  // For forecast capability check — tests Render backend
-  if (!RENDER_BACKEND || RENDER_BACKEND === 'YOUR_RENDER_URL_HERE') return false;
   try {
-    const r = await fetch(`${RENDER_BACKEND}/ping`, {signal: AbortSignal.timeout(4000)});
+    const r = await fetch(`${backendUrl()}/ping`, {signal: AbortSignal.timeout(6000)});
     return r.ok;
   } catch { return false; }
 }
 
-// ── Direct Yahoo Finance fetch (history & quote) ─────────────────────────
+// ── History fetch (served from SQLite on server) ──────────────────────────
 async function yahooHistory(sym, start, end, loaderSuffix='1') {
-  const lEl = document.getElementById('l'+loaderSuffix+'s');
-  if(lEl) lEl.textContent = 'Fetching market data…';
+  const lEl  = document.getElementById('l'+loaderSuffix+'s');
+  const msgs = [
+    'Loading from local database...',
+    'Fetching market data... (this may take a moment)',
+    'Downloading 10-year history for first use...',
+    'Almost there — processing data...',
+  ];
+  if (lEl) lEl.textContent = msgs[0];
 
-  const ticker  = sym + '.NS';
-  const period1 = Math.floor(new Date(start).getTime() / 1000);
-  const period2 = Math.floor(new Date(end).getTime()   / 1000);
+  const params = new URLSearchParams({sym, start, end});
+  const res    = await patientFetch(`${backendUrl()}/history?${params}`, lEl, msgs);
+  const json   = await res.json();
 
-  // Choose interval: weekly for >2 years, daily otherwise
-  const days = (new Date(end) - new Date(start)) / 86400000;
-  const interval = days > 730 ? '1wk' : '1d';
+  if (!json.ok) throw new Error(json.error || 'Server error');
+  if (!json.rows || !json.rows.length) throw new Error('No data returned for this period.');
 
-  const url = `${YF_PROXY}/v8/finance/chart/${ticker}?period1=${period1}&period2=${period2}&interval=${interval}&includePrePost=false`;
-  const proxy = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
-
-  const res  = await fetch(proxy, {signal: AbortSignal.timeout(30000)});
-  const wrap = await res.json();
-  const data = JSON.parse(wrap.contents);
-
-  const result = data?.chart?.result?.[0];
-  if (!result) throw new Error('No market data returned. The symbol may be invalid or the date range has no trading data.');
-
-  const q  = result.indicators.quote[0];
-  const ts = result.timestamp;
-
-  // Filter out null candles (non-trading days Yahoo sometimes includes)
-  const valid = ts.map((t,i) => ({t, o:q.open[i], h:q.high[i], l:q.low[i], c:q.close[i], v:q.volume[i]}))
-                  .filter(r => r.c != null && r.c > 0);
-
-  const timestamps = valid.map(r => r.t);
-  const opens      = valid.map(r => r.o || r.c);
-  const highs      = valid.map(r => r.h || r.c);
-  const lows       = valid.map(r => r.l || r.c);
-  const closes     = valid.map(r => r.c);
-  const volumes    = valid.map(r => r.v || 0);
-
-  const meta = result.meta || {};
+  const rows = json.rows;
+  const info = json.info || {};
+  const timestamps=[], opens=[], highs=[], lows=[], closes=[], volumes=[];
+  rows.forEach(r => {
+    timestamps.push(new Date(r.date).getTime()/1000);
+    opens.push(r.open); highs.push(r.high); lows.push(r.low);
+    closes.push(r.close); volumes.push(r.volume);
+  });
   const last = closes[closes.length-1] || 0;
   const prev = closes[closes.length-2] || last;
-
   return {chart:{result:[{
     timestamp: timestamps,
     meta: {
-      regularMarketPrice:   meta.regularMarketPrice   || last,
-      chartPreviousClose:   meta.chartPreviousClose   || prev,
-      previousClose:        meta.chartPreviousClose   || prev,
-      regularMarketOpen:    meta.regularMarketOpen    || opens[opens.length-1],
-      regularMarketDayHigh: meta.regularMarketDayHigh || highs[highs.length-1],
-      regularMarketDayLow:  meta.regularMarketDayLow  || lows[lows.length-1],
-      regularMarketVolume:  meta.regularMarketVolume  || volumes[volumes.length-1],
-      fiftyTwoWeekHigh:     meta.fiftyTwoWeekHigh     || Math.max(...highs),
-      fiftyTwoWeekLow:      meta.fiftyTwoWeekLow      || Math.min(...lows.filter(v=>v>0)),
+      regularMarketPrice:   info.regularMarketPrice   || last,
+      chartPreviousClose:   info.chartPreviousClose   || prev,
+      previousClose:        info.chartPreviousClose   || prev,
+      regularMarketOpen:    info.regularMarketOpen    || opens[opens.length-1],
+      regularMarketDayHigh: info.regularMarketDayHigh || highs[highs.length-1],
+      regularMarketDayLow:  info.regularMarketDayLow  || lows[lows.length-1],
+      regularMarketVolume:  info.regularMarketVolume  || volumes[volumes.length-1],
+      fiftyTwoWeekHigh:     info.fiftyTwoWeekHigh     || Math.max(...highs),
+      fiftyTwoWeekLow:      info.fiftyTwoWeekLow      || Math.min(...lows.filter(v=>v>0)),
     },
     indicators:{quote:[{open:opens,high:highs,low:lows,close:closes,volume:volumes}]}
   }]}};
@@ -1423,137 +1439,18 @@ async function yahooQuote(sym) {
   } catch { return null; }
 }
 
-// ── Direct Yahoo Finance fetch for indicators ─────────────────────────────
+// ── Indicators (served from SQLite on server) ─────────────────────────────
 async function fetchIndicatorsOnline(sym) {
-  const ticker  = sym + '.NS';
-  const now     = new Date();
-  const period2 = Math.floor(now.getTime() / 1000);
-  const period1 = Math.floor((now - 730*86400000) / 1000);
-
-  const histUrl   = `${YF_PROXY}/v8/finance/chart/${ticker}?period1=${period1}&period2=${period2}&interval=1d`;
-  const quoteUrl  = `${YF_PROXY}/v10/finance/quoteSummary/${ticker}?modules=defaultKeyStatistics,financialData,summaryDetail,assetProfile`;
-  const proxy     = u => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`;
-
-  const [histRes, quoteRes] = await Promise.all([
-    fetch(proxy(histUrl),  {signal: AbortSignal.timeout(30000)}),
-    fetch(proxy(quoteUrl), {signal: AbortSignal.timeout(30000)}),
-  ]);
-  const histWrap  = await histRes.json();
-  const quoteWrap = await quoteRes.json();
-  const histData  = JSON.parse(histWrap.contents);
-  const quoteData = JSON.parse(quoteWrap.contents);
-
-  const result = histData?.chart?.result?.[0];
-  if (!result) throw new Error(`No data for ${sym}.NS`);
-
-  const q      = result.indicators.quote[0];
-  const ts     = result.timestamp;
-  const closes = ts.map((_,i) => q.close[i]).filter(v => v != null && v > 0);
-  const highs  = ts.map((_,i) => q.high[i]).filter(v => v != null && v > 0);
-  const lows   = ts.map((_,i) => q.low[i]).filter(v => v != null && v > 0);
-  const vols   = ts.map((_,i) => q.volume[i] || 0);
-  const last   = closes[closes.length-1];
-
-  const qs  = quoteData?.quoteSummary?.result?.[0] || {};
-  const kst = qs.defaultKeyStatistics  || {};
-  const fin = qs.financialData         || {};
-  const sum = qs.summaryDetail         || {};
-  const ast = qs.assetProfile          || {};
-
-  function sigStr(val, low, mid) {
-    if (val == null) return 'N/A';
-    return val >= mid ? 'BUY' : val >= low ? 'CAUTION' : 'AVOID';
-  }
-  function fmt(v, suffix='') { return v != null ? v.toFixed(2)+suffix : 'N/A'; }
-
-  // ── MA 50 ─────────────────────────────────────────────────────────────
-  const ma50arr = closes.slice(-50); const ma50 = ma50arr.length>=50 ? ma50arr.reduce((a,b)=>a+b,0)/50 : null;
-  const ma50pct = ma50 ? +((last-ma50)/ma50*100).toFixed(2) : null;
-  const ma50sig = ma50 ? (last>ma50 && ma50pct>2 ? 'BUY' : last<ma50 ? 'AVOID' : 'CAUTION') : 'N/A';
-
-  // ── MA 200 ────────────────────────────────────────────────────────────
-  const ma200arr = closes.slice(-200); const ma200 = ma200arr.length>=200 ? ma200arr.reduce((a,b)=>a+b,0)/200 : null;
-  const ma200pct = ma200 ? +((last-ma200)/ma200*100).toFixed(2) : null;
-  const ma200sig = ma200 ? (last>ma200 && ma200pct>2 ? 'BUY' : last<ma200 ? 'AVOID' : 'CAUTION') : 'N/A';
-
-  // ── RSI 14 ────────────────────────────────────────────────────────────
-  let rsiVal = null;
-  if (closes.length >= 15) {
-    const diffs = closes.slice(-15).map((c,i,a) => i===0 ? 0 : c-a[i-1]).slice(1);
-    const gains = diffs.map(d => d>0?d:0); const losses = diffs.map(d => d<0?-d:0);
-    const ag = gains.reduce((a,b)=>a+b,0)/14; const al = losses.reduce((a,b)=>a+b,0)/14;
-    rsiVal = al===0 ? 100 : +(100 - 100/(1+ag/al)).toFixed(1);
-  }
-  const rsiSig  = rsiVal==null ? 'N/A' : rsiVal<30 ? 'BUY' : rsiVal>70 ? 'AVOID' : 'CAUTION';
-  const rsiNote = rsiVal==null ? 'N/A' : rsiVal<30 ? 'Oversold — potential buy opportunity' : rsiVal>70 ? 'Overbought — consider waiting for pullback' : 'Neutral zone (30–70)';
-
-  // ── P/E ───────────────────────────────────────────────────────────────
-  const peRaw = sum.trailingPE?.raw || kst.forwardPE?.raw;
-  const pe    = peRaw != null ? +peRaw.toFixed(1) : null;
-  const peSig = pe==null ? 'N/A' : pe<0 ? 'AVOID' : pe<15 ? 'BUY' : pe<30 ? 'CAUTION' : 'AVOID';
-  const peNote= pe==null ? 'P/E not available' : pe<0 ? `Negative P/E (${pe}x) — not profitable` : pe<15 ? `Low P/E (${pe}x) — potentially undervalued` : pe<30 ? `Moderate P/E (${pe}x) — fairly valued` : `High P/E (${pe}x) — may be overvalued`;
-
-  // ── Revenue Growth ────────────────────────────────────────────────────
-  const revGrRaw = fin.revenueGrowth?.raw;
-  const revGr    = revGrRaw != null ? +(revGrRaw*100).toFixed(1) : null;
-  const revSig   = revGr==null ? 'N/A' : revGr>=20 ? 'BUY' : revGr>=10 ? 'CAUTION' : 'AVOID';
-  const revNote  = revGr==null ? 'Revenue growth not available' : `${revGr}% YoY revenue growth`;
-
-  // ── ROE ───────────────────────────────────────────────────────────────
-  const roeRaw = fin.returnOnEquity?.raw;
-  const roe    = roeRaw != null ? +(roeRaw*100).toFixed(1) : null;
-  const roeSig = roe==null ? 'N/A' : roe>=20 ? 'BUY' : roe>=15 ? 'BUY' : roe>=8 ? 'CAUTION' : 'AVOID';
-  const roeNote= roe==null ? 'ROE not available' : roe>=20 ? `Excellent ROE (${roe}%) — above 20% benchmark` : roe>=15 ? `Healthy ROE (${roe}%)` : roe>=8 ? `Moderate ROE (${roe}%)` : `Low ROE (${roe}%) — poor capital efficiency`;
-
-  // ── Debt/Equity ───────────────────────────────────────────────────────
-  const deRaw = fin.debtToEquity?.raw;
-  const de    = deRaw != null ? +(deRaw/100).toFixed(2) : null;
-  const deSig = de==null ? 'N/A' : de<0.5 ? 'BUY' : de<1 ? 'CAUTION' : 'AVOID';
-  const deNote= de==null ? 'D/E not available' : de<0.5 ? `Low debt (${de}x) — very safe balance sheet` : de<1 ? `Moderate debt (${de}x) — manageable` : `High debt (${de}x) — significant financial risk`;
-
-  // ── Promoter Holding ──────────────────────────────────────────────────
-  const insider = kst.heldPercentInsiders?.raw;
-  const inst    = kst.heldPercentInstitutions?.raw;
-  const ph      = insider != null ? +(insider*100).toFixed(1) : null;
-  const ih      = inst    != null ? +(inst*100).toFixed(1)    : null;
-  const prSig   = ph==null ? 'N/A' : ph>=50 ? 'BUY' : ph>=30 ? 'CAUTION' : 'AVOID';
-  const prNote  = ph==null ? 'Holding data not available' : ph>=50 ? `High promoter holding (${ph}%) — strong management confidence` : ph>=30 ? `Moderate promoter holding (${ph}%)` : `Low promoter holding (${ph}%)`;
-
-  // ── Sector / 52-Week Trend ────────────────────────────────────────────
-  const high52     = Math.max(...highs.slice(-252));
-  const low52      = Math.min(...lows.slice(-252));
-  const pctFH      = +((last-high52)/high52*100).toFixed(1);
-  const pctFL      = +((last-low52)/low52*100).toFixed(1);
-  const stSig      = pctFH>-10 ? 'BUY' : pctFL<20 ? 'AVOID' : 'CAUTION';
-  const stNote     = pctFH>-10 ? 'Near 52-week high — strong upward momentum' : pctFL<20 ? 'Near 52-week low — weak trend' : 'Mid-range — consolidating';
-
-  // ── Overall score ─────────────────────────────────────────────────────
-  const scoreMap   = {BUY:1,CAUTION:0,AVOID:-1,'N/A':null};
-  const weights    = {ma50:1,ma200:2,rsi:2,pe:2,revenue_growth:2,roe:2,debt_equity:2,promoter:1,sector_trend:1};
-  const signals    = {ma50:ma50sig,ma200:ma200sig,rsi:rsiSig,pe:peSig,revenue_growth:revSig,roe:roeSig,debt_equity:deSig,promoter:prSig,sector_trend:stSig};
-  let totalW=0, totalS=0;
-  Object.entries(weights).forEach(([k,w])=>{
-    const s = scoreMap[signals[k]];
-    if(s==null) return;
-    totalS += s*w; totalW += w;
-  });
-  const overallScore  = totalW>0 ? +((totalS/totalW)*100).toFixed(1) : 0;
-  const overallSignal = overallScore>=50?'BUY':overallScore>=15?'BUY':overallScore>=-15?'CAUTION':overallScore>=-50?'AVOID':'AVOID';
-  const overallLabel  = overallScore>=50?'Strong Buy':overallScore>=15?'Moderate Buy':overallScore>=-15?'Neutral / Hold':overallScore>=-50?'Moderate Caution':'Strong Caution';
-
-  return {
-    ok: true,
-    ma50:           {value: ma50?`₹${ma50.toFixed(2)}`:'N/A', pct_above:ma50pct, signal:ma50sig,  note:`Price is ${ma50&&last>ma50?'above':'below'} MA50 by ${ma50?Math.abs(ma50pct).toFixed(1):'-'}%`},
-    ma200:          {value: ma200?`₹${ma200.toFixed(2)}`:'N/A', pct_above:ma200pct, signal:ma200sig, note:`Price is ${ma200&&last>ma200?'above':'below'} MA200 by ${ma200?Math.abs(ma200pct).toFixed(1):'-'}%`},
-    rsi:            {value: rsiVal??'N/A', signal:rsiSig, note:rsiNote},
-    pe:             {value: pe!=null?`${pe}x`:'N/A', signal:peSig, note:peNote},
-    revenue_growth: {value: revGr!=null?`${revGr}%`:'N/A', signal:revSig, note:revNote},
-    roe:            {value: roe!=null?`${roe}%`:'N/A', signal:roeSig, note:roeNote},
-    debt_equity:    {value: de!=null?`${de}x`:'N/A', signal:deSig, note:deNote},
-    promoter:       {value: ph!=null?`${ph}%`:'N/A', institutional:ih!=null?`${ih}%`:null, signal:prSig, note:prNote},
-    sector_trend:   {value: ast.sector||'N/A', industry:ast.industry||null, pct_from_high:pctFH, pct_from_low:pctFL, signal:stSig, note:stNote},
-    overall: {score:overallScore, signal:overallSignal, label:overallLabel, last_price:+last.toFixed(2), high52:+high52.toFixed(2), low52:+low52.toFixed(2)},
-  };
+  const msgs = [
+    'Loading indicators from database...',
+    'Calculating RSI, MA50, MA200...',
+    'Fetching fundamentals (P/E, ROE, D/E)...',
+    'Computing overall score...',
+  ];
+  const res  = await patientFetch(`${backendUrl()}/indicators?sym=${sym}`, null, msgs);
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error?.split('\n')[0] || 'Indicator fetch failed');
+  return data;
 }
 
 // ═══════════════════════════════════════════════
@@ -2229,18 +2126,14 @@ async function checkForecastCaps(){
       color:${ok?'var(--accent)':'var(--muted)'};
       border:1px solid ${ok?'rgba(0,212,170,0.3)':'var(--border)'}" title="${msg||''}">
       ${ok?'✓':'✗'} ${label}</span>`;
-
-  if (!RENDER_BACKEND || RENDER_BACKEND === 'YOUR_RENDER_URL_HERE') {
-    caps.innerHTML = mkBadge('AI Backend', false, 'Set RENDER_BACKEND in index.html after deploying to Render.com');
-    return;
-  }
   try{
-    const r = await fetch(`${RENDER_BACKEND}/ping`, {signal:AbortSignal.timeout(5000)});
+    const r = await fetch(`${backendUrl()}/ping`, {signal:AbortSignal.timeout(6000)});
     const j = await r.json();
-    caps.innerHTML = mkBadge('LSTM (PyTorch)', j.lstm, 'Loaded on Render backend') +
-                     mkBadge('Prophet',        j.prophet, 'Loaded on Render backend');
+    caps.innerHTML = mkBadge('LSTM (PyTorch)', j.lstm,    'Loaded on backend') +
+                     mkBadge('Prophet',        j.prophet, 'Loaded on backend') +
+                     (j.db_mb ? `<span style="font-size:9px;color:var(--muted);font-family:var(--fm);padding:2px 6px">DB: ${j.db_mb} MB</span>` : '');
   } catch{
-    caps.innerHTML = mkBadge('AI Backend', false, 'Render backend unreachable — check deployment');
+    caps.innerHTML = mkBadge('Backend', false, 'Server not reachable');
   }
 }
 
@@ -2272,11 +2165,11 @@ async function doForecast(){
   }, 3500);
 
   try{
-    if (!RENDER_BACKEND || RENDER_BACKEND === 'YOUR_RENDER_URL_HERE') {
-      throw new Error('AI Forecast backend not configured yet.<br><small style="opacity:.7">Deploy server.py to Render.com and set RENDER_BACKEND in index.html — see the README for step-by-step instructions.</small>');
-    }
     const params = new URLSearchParams({sym: sel1.s, days: fcDays, model: fcModel});
-    const res  = await fetch(`${RENDER_BACKEND}/forecast?${params}`, {signal: AbortSignal.timeout(300000)});
+    const res  = await patientFetch(`${backendUrl()}/forecast?${params}`,
+      document.getElementById('fc1loadmsg'),
+      ['Fetching training data from database...','Engineering features (MA, RSI)...','Training model on historical patterns...','Running forecast iteration...','Computing confidence bands...']
+    );
     const data = await res.json();
     if(!data.ok) throw new Error(data.error || 'Forecast failed');
     fcData = data;
@@ -2285,7 +2178,7 @@ async function doForecast(){
     document.getElementById('fc1err').style.display = 'block';
     document.getElementById('fc1err').innerHTML =
       `<div class="err">⚠️ Forecast error: ${e.message.split('\n')[0]}
-       <br><small style="opacity:.6">Make sure the Render backend is deployed and RENDER_BACKEND is set in index.html.</small></div>`;
+       <br><small style="opacity:.6">The server is still processing — please wait a moment and try again.</small></div>`;
   } finally{
     clearInterval(ticker);
     document.getElementById('fc1loader').style.display = 'none';
