@@ -1499,7 +1499,7 @@ function backendUrl() {
   // In a hosted (GitHub Pages) context RENDER_BACKEND is used
   return (typeof window !== 'undefined' && window.location.protocol === 'file:')
     ? SERVER
-    : (RENDER_BACKEND !== 'YOUR_RENDER_URL_HERE' ? RENDER_BACKEND : SERVER);
+    : (RENDER_BACKEND !== 'https://nse-stock-backend-k0pl.onrender.com' ? RENDER_BACKEND : SERVER);
 }
 
 // ── Patient fetch: never shows a timeout error, retries silently ──────────
